@@ -75,13 +75,7 @@ for num_shot in "${NUM_SHOTS[@]}"; do
         --att_refinement --att_adapt --att_selection --use_attributes\
         --output_dir "experiments/full_repeat/${MODEL_NAME}/t2"\
         --eval_model "experiments/full_repeat/${MODEL_NAME}/t2/${dataset}_bast.pth" \
-        --output_file "wb.csv" --prev_output_file "wb.csv"\
-        --log_distribution true --balance $BALANCE --alpha $ALPHA \
-        --fit_method "wb"\
-        --fine_alpha True\
-        # --fit_bs 2 --fit_epoch 10000 --fit_lr 0.01 
-        # --fine_balance True\
-
+        --log_distribution true --fit_method "wb"
       counter=$((counster + 1))
     done
   done

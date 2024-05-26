@@ -84,18 +84,12 @@ def get_args_parser():
     parser.add_argument('--fit_lr', default=0.01, type=float)
 
     parser.add_argument('--TCP', default='295499', type=str)
-    parser.add_argument('--fine_alpha', default=False, type=bool)
-    parser.add_argument('--fine_balance', default=False, type=bool)
     
     return parser
 
 
 def save_result(args, output):
-    # care_keys = ['alpha', 'balance', 'fit_method', 'fit_bs', 'fit_epoch', 'unknown_classnames_file']
-    # for key in care_keys:
-    #     if key not in output:
-    #         output[key] = args.__dict__[key]
-        
+
     output = pd.DataFrame(output, index=[0])
     if args.prev_output_file:
         try:
@@ -132,50 +126,6 @@ def save_model(args, model, ap=None):
             'att_query_mask': att_query_mask
         }, save_name)
 
-def alpha_tuning(args, model, postprocessors, data_loader_val, dataset_val, device):
-    for alpha in range(0, 11):
-        model.unk_head.alpha = float(alpha) / 10
-        balance = model.unk_head.unknwown_distribution.balance
-        test_stats, coco_evaluator = evaluate(model, postprocessors, data_loader_val, dataset_val, device,
-                                                args.output_dir, args)
-        output = test_stats['metrics']
-        output.update({'model': args.model_name,
-                        'dataset': args.dataset,
-                        'unk_proposal': args.unk_proposal,
-                        'unk_method': args.unk_method,
-                        'classnames_file': args.classnames_file,
-                        'unknown_classnames_file': args.unknown_classnames_file,
-                        'alpha': float(alpha) / 10,
-                        'balance': balance,})
-        save_result(args, output)
-
-def balance_tuning(args, data_loader_val, dataset_val, device):
-    start, end = 10, 11
-
-    for balance in range(start, end):
-        args.balance = float(balance) / 10
-        model, postprocessors = build_model(args)
-        model.to(device)
-        model.unk_head.unknwown_distribution.balance = float(balance) / 10
-        test_stats, coco_evaluator = evaluate(model, postprocessors, data_loader_val, dataset_val, device,
-                                                args.output_dir, args)
-        output = test_stats['metrics']
-        output.update({'model': args.model_name,
-                        'dataset': args.dataset,
-                        'unk_proposal': args.unk_proposal,
-                        'unk_method': args.unk_method,
-                        'classnames_file': args.classnames_file,
-                        'unknown_classnames_file': args.unknown_classnames_file,
-                        'balance': float(balance) / 10,})
-        save_result(args, output)
-
-def balance_and_alpha_tuning(args, data_loader_val, dataset_val, device):
-    for balance in range(1, 11):
-        args.balance = float(balance) / 10
-        model, postprocessors = build_model(args)
-        model.to(device)
-        alpha_tuning(args, model, postprocessors, data_loader_val, dataset_val, device)
-
 def main(args):
     print(args)
 
@@ -204,14 +154,6 @@ def main(args):
     best_kmap  = -1 
     bad        = 0
 
-    if args.fine_alpha and args.fine_balance:
-        balance_and_alpha_tuning(args, data_loader_val, dataset_val, device)
-        return
-
-    # balance调参
-    if args.fine_balance:
-        balance_tuning(args, data_loader_val, dataset_val, device)
-        return
 
     if (len(neg_sup_ep) > 1 or len(neg_sup_lr) > 1) and args.image_conditioned and args.att_refinement and (not args.eval_model):
         for eps in tqdm(neg_sup_ep, desc='Epochs', leave=False):
@@ -269,10 +211,6 @@ def main(args):
         viz(model, postprocessors, data_loader_val, device, args.output_dir, dataset_val, args)
         return
 
-    # alpha调参
-    if args.fine_alpha:
-        alpha_tuning(args, model, postprocessors, data_loader_val, dataset_val, device)
-        return
     
     unk_methods = args.unk_methods.split(",")
     for unk_method in unk_methods:

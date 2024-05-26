@@ -44,7 +44,6 @@ def split_into_chunks(lst, batch_size):
 class GaussianDistribution(torch.nn.Module):
     def __init__(self, type='gm'):
         super(GaussianDistribution, self).__init__()
-        # print(f'using {type} fit')
         self.type = type
         self.gms = []
         self.wbs = []
@@ -100,7 +99,6 @@ class GaussianDistribution(torch.nn.Module):
         parms = self.gms if self.type == 'gm' else self.wbs
         optimizer = torch.optim.Adam(parms, lr=lr)
         min_loss = float('inf')
-        # tqdm_iter = tqdm(range(max_epoch))
         x = x.unsqueeze(0).repeat(bs, 1)
         y = y.unsqueeze(0).repeat(bs, 1)
         stable_count = 0
@@ -114,8 +112,6 @@ class GaussianDistribution(torch.nn.Module):
             if stable_count > 5:
                 break
             optimizer.step()
-            
-            # tqdm_iter.set_description(f'loss: {loss.item()}')
             min_loss = min(min_loss, loss.item())
         return min_loss
             
@@ -161,8 +157,6 @@ class UnkDetHead(nn.Module):
         self.out_csv = Path(os.path.join(args.output_dir, f'{args.dataset}', 'model_message', 'our_objectness.csv'))
         if self.out_csv.exists():
             os.remove(self.out_csv)
-        # if self.out_csv.parent.exists() is False:
-        #     self.out_csv.parent.mkdir(parents=True)
         self.out_csv = None
         
         if args.log_distribution:
@@ -242,14 +236,11 @@ class UnkDetHead(nn.Module):
             objectness = objectness.unsqueeze(-1)
             offical_obj = self.process_logits(att_logits)
             offical_obj = offical_obj.max(dim=-1, keepdim=True)[0]
-            # self.log_objectness({'our_objectness': objectness,
-            #                      'offical_objectness': offical_obj})
             objectness *= (1 - mcm)
             unknown_sim = self.unknwown_distribution.get_known_distribution(cos_sim)
-            # bs, patch*patch, num_category
             unknown_sim = (unknown_sim + k_logits.sigmoid()).softmax(dim=-1)
 
-        if self.proc_obj: # 对objectness进行处理
+        if self.proc_obj: 
             objectness -= objectness.mean()
             if objectness.std() != 0:
                 objectness /= objectness.std()
@@ -269,14 +260,11 @@ class UnkDetHead(nn.Module):
         values = [value.cpu().view(-1) for value in list(objectness.values())]
         values = torch.stack(values, dim=-1).tolist()
 
-        # 检查文件是否存在
         file_exists = os.path.isfile(self.out_csv)
         with open(self.out_csv, 'a', newline='') as f:
             writer = csv.writer(f)
-            # 如果文件不存在，写入列名
             if not file_exists:
                 writer.writerow(header)
-            # 写入数据
             writer.writerows(values)
 
 
@@ -337,29 +325,11 @@ class ClassDistribution():
     def fit_distribution(self, unknown_mean_y):
         ret_distribution = []
         x = torch.arange(-1, 1, self.mean_interval)
-        # fit double gauss
-        def double_gauss(x, a1, mu1, sigma1, a2, mu2, sigma2):
-            return a1 * np.exp(-(x - mu1)**2 / (2 * sigma1**2)) + a2 * np.exp(-(x - mu2)**2 / (2 * sigma2**2))
         
         def get_y_label(f, x, mask):
             ret = f(x[mask])
             return ret.tolist()
         
-        def fit_func(**kwargs):
-            valid_mask = kwargs.get('valid_mask')
-            kwargs.pop('valid_mask')
-            f = kwargs.get('f')
-            try:
-                f_parms, _ = curve_fit(**kwargs)
-                fit_y = torch.tensor(f(x, *f_parms))
-                if fit_y.min() < 0:                 # 保证图像是非负的
-                    fit_y -= fit_y.min()
-                return fit_y
-            except:
-                pass
-            ret = np.zeros_like(valid_mask)
-            ret[valid_mask] = kwargs.get('ydata')
-            return torch.tensor(ret)
         
         def window_max(y, window_size=20, top_k=3):
             left = 0
@@ -378,7 +348,6 @@ class ClassDistribution():
             if len(valid_x) == 0:
                 ret_distribution.append(torch.tensor(att_val).to('cuda'))
                 continue
-            # 线性插值
             f_linear = interp1d(valid_x.to('cpu'), valid_y.to('cpu'))
             f_linear_y = torch.tensor(get_y_label(f_linear, x, valid_mask))
             fit_model = GaussianDistribution(type=self.args.fit_method)
@@ -401,7 +370,6 @@ class ClassDistribution():
         for file_name in tqdm(distribution_files, desc='load distribution:'):
             file_path = os.path.join(self.att_root, file_name)
             distribution = torch.load(file_path)
-            # (bs, patch*patch, num_known), (bs, patch*patch, num_att)
             logits, cos_sim = distribution['logits'], distribution['cos_sim']
             batch_size, num_point, num_att = cos_sim.shape 
             logits = logits.view(-1, self.category_num)
@@ -415,10 +383,8 @@ class ClassDistribution():
                     self.categories[cate_id][att_id].append([cos_sim[ :, att_id].view(-1), logits[ :, cate_id].view(-1)]) 
         
         ret = [[] for cate_id in range(self.category_num + 1)]      
-        # ret = []  
         for att_id in tqdm(range(num_att), desc="build distribution:"):
             unknown_y = torch.zeros(int(2/mean_interval), device=device)
-            # 得到每一个属性的每一类的分布
             for cate_id in range(self.category_num):
                 category_y = torch.zeros(int(2/mean_interval), device=device)
                 att_distribution = self.categories[cate_id][att_id]
@@ -430,7 +396,6 @@ class ClassDistribution():
                         ret[cate_id].append(category_y)
                         continue
                     else:
-                        # logit = logit * w
                         logit = logit.pow(self.balance) * w.pow(1-self.balance)
                     if category_distribution:
                         ret[cate_id].append(self.category_distribution(cos_sim, logit, category_y, device=device))
@@ -722,7 +687,7 @@ class FOMO(nn.Module):
             'a photo of the small {c}.'
         """
         self.templates = templates
-        self.num_attributes_per_class = args.num_att_per_class      # 每一类属性的数量
+        self.num_attributes_per_class = args.num_att_per_class    
 
         if image_conditioned:
             fs_dataset = FewShotDataset(
@@ -748,15 +713,11 @@ class FOMO(nn.Module):
                     attributes = json.loads(f.read())
 
                 self.attributes_texts = [f"object which (is/has/etc) {cat} is {a}" for cat, att in attributes.items() for a in att]
-                # 创建W矩阵
                 self.att_W = torch.rand(len(self.attributes_texts), len(known_class_names), device=device)
 
                 with torch.no_grad():
-                    # 获取整个数据集所有类别的embedding，和它的平均值，获取方法见：embed_image_query
                     mean_known_query_embeds, embeds_dataset = self.get_mean_embeddings(fs_dataset)
-                    # 获取每个属性的embedding（所有模版的平均值），和它的mask
                     text_mean_norm, att_query_mask = self.prompt_template_ensembling(self.attributes_texts, templates)
-                    # 冻结文本编码器的梯度
                     self.att_embeds = text_mean_norm.detach().clone().to(device)
                     self.att_query_mask = att_query_mask.to(device)
 
@@ -799,7 +760,7 @@ class FOMO(nn.Module):
                 self.att_query_mask = None
         else:
             self.att_embeds, self.att_query_mask = self.prompt_template_ensembling(all_classnames, templates)
-            self.att_W = torch.eye(len(all_classnames), device=self.device)     # 单位矩阵
+            self.att_W = torch.eye(len(all_classnames), device=self.device)    
 
         if args.log_distribution:
             self.log_distribution(fs_dataloader, args)
@@ -851,7 +812,6 @@ class FOMO(nn.Module):
                     if image_embeds is None:
                         continue
                     targets = torch.stack(targets).to(self.device)
-                # 正则化
                 cos_sim = cosine_similarity(image_embeds, self.att_embeds, dim=-1)
                 logits = torch.matmul(cos_sim, self.att_W)
                 loss = criterion(logits, targets)  # Compute loss
@@ -865,11 +825,6 @@ class FOMO(nn.Module):
         return
 
     def patch_cosine_similarity(self, image_embeds, att_embeds):
-        """
-            计算patch和类别之间的余弦相似度
-            att_embeds: (1, num_att, embed_dim)
-            image_embeds: (bs, patch*patch, embed_dim)
-        """
         att_embeds = att_embeds.squeeze(0)
         ret = []
         for att_embed in att_embeds:
@@ -902,7 +857,6 @@ class FOMO(nn.Module):
         for _ in pbar:
             optimizer.zero_grad()
             self.att_W.data = torch.clamp(self.att_W.data, 0, 1)
-            # 防止内存溢出
             cos_sim = self.patch_cosine_similarity(image_embeddings, self.att_embeds)
             # cos_sim = cosine_similarity(image_embeddings, self.att_embeds, dim=-1)   # （num_class, num_att）
             logits = torch.matmul(cos_sim, self.att_W)
@@ -923,18 +877,10 @@ class FOMO(nn.Module):
         return
 
     def get_mean_embeddings(self, fs_dataset):
-        """
-            得到每一种类别的数据集等级的平均embedding（return 1）。与原始的embedding（return 2）。
-        """
         dataset = {i: [] for i in range(len(self.known_class_names))}
         for img_batch in split_into_chunks(range(len(fs_dataset)), 3):
-            """
-                'image': tensor(bs, 3, w, h)
-                'bbox': [[[归一化的xyxy], [], ... ], [[], [], ...]]
-                'label': [类别ID]
-            """
             image_batch = collate_fn([fs_dataset.get_no_aug(i) for i in img_batch])
-            grouped_data = defaultdict(list)    # 用于存储每个类别的数据
+            grouped_data = defaultdict(list)    
 
             for bbox, label, image in zip(image_batch['bbox'], image_batch['label'], image_batch['image']):
                 grouped_data[label].append({'bbox': bbox, 'image': image})
@@ -966,14 +912,6 @@ class FOMO(nn.Module):
         self.att_embeds.requires_grad_(False)
 
     def prompt_template_ensembling(self, classnames, templates):
-        """对所有的模板计算文本编码器的正则值
-        Args:
-            classnames (_type_): 类名列表
-            templates (_type_): 模板列表
-
-        Returns:
-            _type_: _description_
-        """
         print('performing prompt ensembling')
         text_sum = torch.zeros((1, len(classnames), self.model.owlvit.text_embed_dim)).to(self.device)
 
@@ -1000,16 +938,6 @@ class FOMO(nn.Module):
             self, query_image_features: torch.FloatTensor, query_feature_map: torch.FloatTensor,
             each_query_boxes
     ) -> torch.FloatTensor:
-        """                         
-            使用图像的查询生成box，然后计算box与查询box的前20%的box，最后计算与平均Class Embedding最接近的box。
-            获取它的Class Embedding（保存在query_embeds），与对应的box_indices， bad_indexes保存匹配失败的图像ID
-            query_image_features (torch.FloatTensor): (bs, patch*patch, hidden_dim)
-            query_feature_map (torch.FloatTensor): (bs, patch, patch, hidden_dim)
-            each_query_boxes (_type_): 
-
-        Returns:
-            torch.FloatTensor: _description_
-        """
         _, class_embeds = self.model.class_predictor(query_image_features)
         pred_boxes = self.model.box_predictor(query_image_features, query_feature_map) # (bs, patch*patch, 4)
         pred_boxes_as_corners = box_ops.box_cxcywh_to_xyxy(pred_boxes)
