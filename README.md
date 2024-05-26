@@ -3,10 +3,10 @@
 Open-World Object Detection (OWOD) is a challenging task that requires the detector to identify unlabeled objects and continuously demands the detector to learn new knowledge based on existing ones. Existing methods primarily focus on recalling unknown objects, neglecting to explore the reasons behind them. This paper aims to understand the model's behavior in predicting the unknown category. First, we model the text attribute and the positive sample probability, obtaining their empirical probability, which can be seen as the detector's estimation of the likelihood of the target with certain known attributes being predicted as the foreground. Then, we jointly decide whether the current object should be categorized in the unknown category based on the empirical, the in-distribution, and the out-of-distribution probability. Finally, based on the decision-making process, we can infer the similarity of an unknown object to known classes and identify the attribute with the most significant impact on the decision-making process. This additional information can help us understand the behavior of the model's prediction in the unknown class. The evaluation results on the Real-World Object Detection (RWD) benchmark, which consists of five real-world application datasets, show that we surpassed the previous state-of-the-art (SOTA) with an absolute gain of 5.3 mAP for unknown classes, reaching 20.5 mAP. 
 
 ## Overall Structure
-![image](https://github.com/xxyzll/UMB/assets/108440857/5c73a907-aeec-4279-bc43-522f479445f7)
+![image](img/main.png)
 
 ## Visualization
-![Visualization](https://github.com/xxyzll/UMB/assets/108440857/7bee4dd7-67d1-418d-be1e-cffc077569e1)
+![Visualization](img/visualization.png)
 
 
 ## Start
