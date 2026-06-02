@@ -35,7 +35,10 @@ import os
 import json
 import pandas as pd
 import csv
-import torch_scatter
+try:
+    import torch_scatter
+except ImportError:
+    torch_scatter = None
 
 
 def split_into_chunks(lst, batch_size):
@@ -154,6 +157,21 @@ class UnkDetHead(nn.Module):
         self.process_mcm = nn.Softmax(dim=-1)
         args = kwargs['args']
         self.alpha = (0.8 if args.alpha == -1 else args.alpha)
+        self.paper_unknown_objectness = getattr(args, "paper_unknown_objectness", False)
+        self.paper_alpha_mix = self.paper_unknown_objectness or getattr(args, "paper_alpha_mix", False)
+        self.paper_no_obj_zscore = self.paper_unknown_objectness or getattr(args, "paper_no_obj_zscore", False)
+        # ─── Idea A: Dual-Score Ensemble (Distribution + MCM) ────────────────
+        self.use_dual_score = getattr(args, 'use_dual_score', False)
+        self.dual_w = getattr(args, 'dual_w', 0.3)
+        # ─── Idea B: MCM-SACA (per-patch alpha via MCM uncertainty) ──────────
+        self.use_saca_mcm = getattr(args, 'use_saca_mcm', False)
+        self.saca_mcm_gamma = getattr(args, 'saca_mcm_gamma', 2.0)
+        self.saca_mcm_beta  = getattr(args, 'saca_mcm_beta',  0.0)
+        self.use_known_preserving_gate = getattr(args, 'use_known_preserving_gate', False)
+        self.known_gate_threshold = getattr(args, 'known_gate_threshold', 0.6)
+        self.known_gate_gamma = getattr(args, 'known_gate_gamma', 1.0)
+        self.known_gate_floor = getattr(args, 'known_gate_floor', 0.05)
+        self.known_gate_source = getattr(args, 'known_gate_source', 'softmax')
         self.out_csv = Path(os.path.join(args.output_dir, f'{args.dataset}', 'model_message', 'our_objectness.csv'))
         if self.out_csv.exists():
             os.remove(self.out_csv)
@@ -216,6 +234,7 @@ class UnkDetHead(nn.Module):
         unk_logits = logits[..., self.known_dims:].max(dim=-1, keepdim=True)[0]
         logits = torch.cat([k_logits, unk_logits], dim=-1)
         objectness = torch.ones_like(unk_logits).squeeze(-1)
+        known_gate_conf = None
 
         if "mean" in self.method:
             sm_logits = self.process_logits(att_logits)
@@ -227,25 +246,65 @@ class UnkDetHead(nn.Module):
 
         if "mcm" in self.method:
             mcm = self.process_mcm(k_logits).max(dim=-1, keepdim=True)[0]
+            known_gate_conf = mcm
             objectness = (1 - mcm)
 
         unknown_sim, mean_y = None, None
         if self.unknwown_distribution:
-            mcm = self.process_mcm(k_logits).max(dim=-1, keepdim=True)[0]
-            objectness, mean_y = self.unknwown_distribution.unknown_prediction(att_logits, cos_sim, alpha=self.alpha)
-            objectness = objectness.unsqueeze(-1)
+            mcm = self.process_mcm(k_logits).max(dim=-1, keepdim=True)[0]  # (bs, n_patches, 1)
+
+            # ─── Idea B: MCM-SACA – per-patch adaptive alpha ─────────────────
+            if self.use_saca_mcm:
+                mcm_unc = 1.0 - mcm.squeeze(-1)   # (bs, n_patches); high = unknown-like
+                alpha_patch = torch.sigmoid(
+                    self.saca_mcm_gamma * mcm_unc + self.saca_mcm_beta
+                )                                  # (bs, n_patches)
+                eff_alpha = alpha_patch
+            else:
+                eff_alpha = self.alpha
+
+            objectness, mean_y = self.unknwown_distribution.unknown_prediction(att_logits, cos_sim, alpha=eff_alpha)
+            objectness = objectness.unsqueeze(-1)  # (bs, n_patches, 1)
             offical_obj = self.process_logits(att_logits)
             offical_obj = offical_obj.max(dim=-1, keepdim=True)[0]
-            objectness *= (1 - mcm)
+
+            if self.use_dual_score:
+                # ─── Idea A: Additive Dual-Score Ensemble ────────────────────
+                # dist_score is already z-score normalised inside unknown_prediction()
+                # Normalise MCM uncertainty to the same scale (patch-wise z-score)
+                mcm_unc = 1.0 - mcm                                         # (bs, n_patches, 1)
+                mcm_unc_mean = mcm_unc.mean(dim=1, keepdim=True)
+                mcm_unc_std  = mcm_unc.std(dim=1, keepdim=True).clamp(min=1e-6)
+                mcm_unc_norm = (mcm_unc - mcm_unc_mean) / mcm_unc_std       # z-score
+                # Additive ensemble: (1-w)*dist_score + w*mcm_uncertainty
+                objectness = (1.0 - self.dual_w) * objectness + self.dual_w * mcm_unc_norm
+            else:
+                # Original: multiplicative MCM gating
+                objectness *= (1 - mcm)
+
             unknown_sim = self.unknwown_distribution.get_known_distribution(cos_sim)
             unknown_sim = (unknown_sim + k_logits.sigmoid()).softmax(dim=-1)
 
         if self.proc_obj: 
-            objectness -= objectness.mean()
-            if objectness.std() != 0:
-                objectness /= objectness.std()
-            objectness = torch.sigmoid(objectness)
-            unknown_sim = self.get_max_att_id(att_logits, cos_sim, objectness, unk_logits)
+            if self.paper_no_obj_zscore and self.unknwown_distribution is not None:
+                objectness = torch.sigmoid(objectness)
+            else:
+                objectness -= objectness.mean()
+                if objectness.std() != 0:
+                    objectness /= objectness.std()
+                objectness = torch.sigmoid(objectness)
+            if self.use_known_preserving_gate:
+                if self.known_gate_source == 'sigmoid':
+                    known_gate_conf = k_logits.sigmoid().max(dim=-1, keepdim=True)[0]
+                if known_gate_conf is None:
+                    known_gate_conf = self.process_mcm(k_logits).max(dim=-1, keepdim=True)[0]
+                gate_den = max(1.0 - self.known_gate_threshold, 1e-6)
+                gate = ((1.0 - known_gate_conf) / gate_den).clamp(0.0, 1.0)
+                gate = gate.pow(self.known_gate_gamma)
+                gate = self.known_gate_floor + (1.0 - self.known_gate_floor) * gate
+                objectness = objectness * gate
+            if self.unknwown_distribution is not None:
+                unknown_sim = self.get_max_att_id(att_logits, cos_sim, objectness, unk_logits)
 
         return logits, objectness.squeeze(-1), unknown_sim, mean_y
     
@@ -276,9 +335,23 @@ class ClassDistribution():
         self.balance = (0.2 if args.balance == -1 else args.balance)
         self.class_att_w = att_w
         self.att_root = Path(os.path.join(self.args.output_dir, f'{self.args.dataset}', 'sim_log'))
-        
+
         self.distributions = self.get_distributions(args.category_distribution)
         self.unknown_att_w = self.unknown_balance()
+
+        # ── Novel ideas initialization ──────────────────────────────────────
+        if getattr(args, 'use_qr', False):
+            self.support_quantiles = self.compute_support_quantiles()
+        if getattr(args, 'use_miwa', False):
+            self.miwa_weights = self.compute_mi_weights()
+        if getattr(args, 'use_saca', False):
+            self.calibrate_saca()
+        # ── Idea C: Support-Conditioned Normalization ───────────────────────
+        if getattr(args, 'use_support_norm', False):
+            self.support_norm_stats = self.compute_support_norm_stats()
+            args.auto_calibration_support_mean = self.support_norm_stats.get('mean')
+            args.auto_calibration_support_std = self.support_norm_stats.get('std')
+            args.auto_calibration_support_n = self.support_norm_stats.get('n')
         
     def get_distributions(self, category_distribution=False, build_unknown_distritbuion=True):
         distribution_root = Path(os.path.join(self.args.output_dir, f'{self.args.dataset}', f'distribution_{self.balance}'))
@@ -299,27 +372,36 @@ class ClassDistribution():
                 distributions = torch.stack(distributions)
                 torch.save(distributions, distribution_root / fit_model_name)
             print(f'load {fit_model_name}')
-        else: 
+        else:
             if build_unknown_distritbuion:
                 print(f'build unknown distribution: ', distribution_root / 'score_distribution_class.pth')
-                score_distributions = self.build_unknown_distribution(mean_interval=self.mean_interval, 
-                                                            category_distribution=True)
-                torch.save(score_distributions, distribution_root / 'score_distribution_class.pth')
+                if 'score_distribution_class.pth' in os.listdir(distribution_root):
+                    score_distributions = torch.load(distribution_root / 'score_distribution_class.pth')
+                    if type(score_distributions) is torch.Tensor:
+                        score_distributions = list(score_distributions)
+                else:
+                    score_distributions = self.build_unknown_distribution(mean_interval=self.mean_interval,
+                                                                category_distribution=True)
+                    torch.save(score_distributions, distribution_root / 'score_distribution_class.pth')
+                if self.args.fit_method == 'score':
+                    distributions = torch.stack(score_distributions)
+                    return distributions
+                score_distributions = [self.fit_distribution(distribution) for distribution in score_distributions]
                 distributions = torch.stack(score_distributions)
-                return distributions
-            
-            if 'score_distribution.pth' in os.listdir(distribution_root):
-                score_distributions = torch.load(distribution_root / 'score_distribution.pth')
+                torch.save(distributions, distribution_root / fit_model_name)
             else:
-                score_distributions = self.build_unknown_distribution(mean_interval=self.mean_interval, 
-                                                            category_distribution=category_distribution)
-                torch.save(score_distributions, distribution_root / 'score_distribution.pth')
-            if category_distribution:
-                score_distributions = [self.fit_distribution(distribution)  for distribution in score_distributions]
-            else:
-                score_distributions[-1] = self.fit_distribution(score_distributions[-1])
-            distributions = torch.stack(score_distributions)
-            torch.save(distributions, distribution_root / fit_model_name)
+                if 'score_distribution.pth' in os.listdir(distribution_root):
+                    score_distributions = torch.load(distribution_root / 'score_distribution.pth')
+                else:
+                    score_distributions = self.build_unknown_distribution(mean_interval=self.mean_interval,
+                                                                category_distribution=category_distribution)
+                    torch.save(score_distributions, distribution_root / 'score_distribution.pth')
+                if category_distribution:
+                    score_distributions = [self.fit_distribution(distribution)  for distribution in score_distributions]
+                else:
+                    score_distributions[-1] = self.fit_distribution(score_distributions[-1])
+                distributions = torch.stack(score_distributions)
+                torch.save(distributions, distribution_root / fit_model_name)
         return distributions
       
     def fit_distribution(self, unknown_mean_y):
@@ -411,35 +493,315 @@ class ClassDistribution():
         logit = logit.view(-1).to(device=device)
         indices = ((cos_sim+1) // self.mean_interval).long()
         start_point = indices.min()
-        
-        max_logits, _ = torch_scatter.scatter_max(logit, indices-start_point)
+
+        normalized_indices = indices - start_point
+        max_logits = self._scatter_max(logit, normalized_indices)
         for idx, max_logit in enumerate(max_logits):
             mean_y[idx+start_point] = max(mean_y[idx+start_point], max_logit)
         return mean_y
 
+    def _scatter_max(self, src, index):
+        if torch_scatter is not None:
+            try:
+                max_logits, _ = torch_scatter.scatter_max(src, index)
+                return max_logits
+            except RuntimeError as exc:
+                if "Not compiled with CUDA support" not in str(exc):
+                    raise
+
+        if hasattr(torch.Tensor, "scatter_reduce_"):
+            out = torch.full(
+                (int(index.max().item()) + 1,),
+                torch.finfo(src.dtype).min,
+                device=src.device,
+                dtype=src.dtype,
+            )
+            out.scatter_reduce_(0, index, src, reduce="amax", include_self=True)
+            return out
+
+        # Compatibility fallback for older PyTorch builds.
+        out = torch.full(
+            (int(index.max().item()) + 1,),
+            torch.finfo(src.dtype).min,
+            device=src.device,
+            dtype=src.dtype,
+        )
+        for idx in index.unique(sorted=True):
+            mask = index == idx
+            out[idx] = src[mask].max()
+        return out
+
     def unknown_prediction(self, logits, cos_sims, alpha=0.8):
         """
-            logits (batch, num_patch*num_patch, num_att): cos similarity with visual embeddings
-        """  
-        class_agnotic_confidence = torch.sigmoid(logits)   # (batch, num_patch*num_patch, num_known)
-        class_agnotic_confidence = class_agnotic_confidence @ self.unknown_att_w
-        class_agnotic_confidence = self.normalize(class_agnotic_confidence)
-        
-        indices = ((cos_sims + 1) // self.mean_interval).long()
+            logits   (batch, n_patches, num_att): attribute cosine similarities
+            cos_sims (batch, n_patches, num_att): same as logits here
+        """
+        use_qr        = getattr(self.args, 'use_qr',        False)
+        use_conformal = getattr(self.args, 'use_conformal',  False)
+        use_saca      = getattr(self.args, 'use_saca',       False)
+        use_miwa      = getattr(self.args, 'use_miwa',       False)
+
+        # ─── Idea A: Quantile Recalibration ─────────────────────────────────
+        if use_qr and hasattr(self, 'support_quantiles'):
+            cos_sims = self.apply_quantile_recalibration(cos_sims)
+
+        # ─── Idea C: MIWA attribute weighting ───────────────────────────────
+        att_w = self.unknown_att_w.to(logits.device)
+        if use_miwa and hasattr(self, 'miwa_weights'):
+            mi_w  = self.miwa_weights.to(logits.device)
+            att_w = att_w * mi_w
+            att_w = att_w / (att_w.sum() + 1e-8) * att_w.shape[0]
+
+        # ─── Class-agnostic confidence ───────────────────────────────────────
+        class_agnotic_confidence = torch.sigmoid(logits)          # (bs, n_patches, num_known)
+        class_agnotic_confidence = class_agnotic_confidence @ att_w
+        if use_conformal:
+            class_agnotic_confidence = self.conformal_normalize(class_agnotic_confidence)
+        else:
+            class_agnotic_confidence = self.normalize(class_agnotic_confidence)
+
+        # ─── Distribution-based unknown logits ───────────────────────────────
+        use_support_norm = getattr(self.args, 'use_support_norm', False)
+        indices = ((cos_sims + 1) // self.mean_interval).long().to(self.distributions.device)
         bs, _, num_att = indices.shape
         mean_y = [self.distributions[-1][att_i][indices[:, :, att_i]] for att_i in range(num_att)]
-        mean_y = torch.stack(mean_y, dim=-1)
-        
-        unknown_logits = ((mean_y @ self.unknown_att_w))
-        unknown_logits = self.normalize(unknown_logits)
-        
-        return ((unknown_logits*alpha + (1-alpha)*class_agnotic_confidence)), \
-                    ((mean_y) * alpha + (logits) * (1-alpha)) * self.unknown_att_w
+        mean_y = torch.stack(mean_y, dim=-1).to(logits.device)
+
+        # ─── Idea D: Attribute Group Max-Pooling ─────────────────────────────
+        use_att_maxpool = getattr(self.args, 'use_att_maxpool', False)
+        if use_att_maxpool:
+            G = getattr(self.args, 'att_max_groups', 50)
+            G = min(G, num_att)
+            K = num_att // G                               # attributes per group
+            n_full = G * K                                 # truncated to full groups
+            # Weight attributes, then take per-group max (captures "any unusual attr")
+            weighted = mean_y[:, :, :n_full] * att_w[:n_full]  # (bs, P, G*K)
+            group_max = weighted.view(bs, -1, G, K).max(dim=-1).values  # (bs, P, G)
+            unknown_logits_raw = group_max.sum(dim=-1)     # (bs, n_patches)
+            # Append remainder if num_att not divisible by G
+            if n_full < num_att:
+                unknown_logits_raw = unknown_logits_raw + (mean_y[:, :, n_full:] * att_w[n_full:]).sum(-1)
+        else:
+            unknown_logits_raw = mean_y @ att_w
+
+        if use_conformal:
+            unknown_logits = self.conformal_normalize(unknown_logits_raw)
+        elif use_support_norm and hasattr(self, 'support_norm_stats'):
+            # ── Idea C: Support-Conditioned Normalization ─────────────────────
+            # Normalize against known-object statistics (support set) instead of
+            # noisy batch statistics → makes alpha optimum more robust/stable
+            s_mean = unknown_logits_raw.new_tensor(self.support_norm_stats['mean'])
+            s_std  = unknown_logits_raw.new_tensor(
+                max(self.support_norm_stats['std'], 1e-6))
+            unknown_logits = (unknown_logits_raw - s_mean) / s_std
+        else:
+            unknown_logits = self.normalize(unknown_logits_raw)
+
+        # ─── Idea D: SACA – per-patch adaptive alpha ─────────────────────────
+        if use_saca and hasattr(self, 'saca_gamma'):
+            # Density proxy: magnitude of raw distribution score
+            log_rho = torch.log(unknown_logits_raw.abs() + 1e-8)  # (bs, n_patches)
+            alpha_map = torch.sigmoid(self.saca_gamma.to(logits.device) * log_rho
+                                      + self.saca_beta.to(logits.device))
+            combined = unknown_logits * alpha_map + (1 - alpha_map) * class_agnotic_confidence
+            att_mix  = mean_y * alpha_map.unsqueeze(-1) + logits * (1 - alpha_map.unsqueeze(-1))
+        elif getattr(self.args, "paper_unknown_objectness", False) or getattr(self.args, "paper_alpha_mix", False):
+            combined = unknown_logits * (1 - alpha) + class_agnotic_confidence * alpha
+            att_mix  = mean_y * (1 - alpha) + logits * alpha
+        else:
+            # alpha may be a per-patch tensor (bs, n_patches) from MCM-SACA
+            if isinstance(alpha, torch.Tensor) and alpha.dim() == 2:
+                a = alpha                          # (bs, n_patches)
+                combined = unknown_logits * a + (1 - a) * class_agnotic_confidence
+                att_mix  = mean_y * a.unsqueeze(-1) + logits * (1 - a).unsqueeze(-1)
+            else:
+                combined = unknown_logits * alpha + (1 - alpha) * class_agnotic_confidence
+                att_mix  = mean_y * alpha + logits * (1 - alpha)
+
+        return combined, att_mix * att_w
         
     def normalize(self, data, dim=1, keepdim=True):
         data -= data.mean(dim=dim, keepdim=keepdim)
         data /= data.std(dim=dim, keepdim=keepdim)
         return data
+
+    # ─── Idea C: Support-Conditioned Normalization ──────────────────────────
+    def compute_support_norm_stats(self):
+        """Compute mean/std of unknown_logits_raw across all few-shot support patches.
+        These stable statistics replace noisy batch-level z-score normalization,
+        reducing the sharp alpha-optimum sensitivity observed on Aerial/Medical.
+        Results are cached per (dataset, balance, fit_method)."""
+        cache_path = Path(os.path.join(
+            self.args.output_dir, self.args.dataset,
+            f'support_norm_stats_b{self.balance}_{self.args.fit_method}.pth'))
+        if cache_path.exists():
+            stats = torch.load(cache_path)
+            print(f'[SupportNorm] loaded: mean={stats["mean"]:.4f}, std={stats["std"]:.4f}')
+            return stats
+
+        print('[SupportNorm] computing support normalization statistics from sim_log...')
+        att_w = self.unknown_att_w.cpu()
+        all_scores = []
+        dist_files = [f for f in os.listdir(self.att_root) if f.endswith('.pth')]
+        for fname in tqdm(dist_files, desc='[SupportNorm] sim_log'):
+            d = torch.load(os.path.join(self.att_root, fname), map_location='cpu')
+            cos_sim = d['cos_sim'].view(-1, d['cos_sim'].shape[-1]).float()   # (N, A)
+            num_att = cos_sim.shape[-1]
+            # Distribution lookup for each support patch
+            indices = ((cos_sim + 1) // self.mean_interval).long().to(self.distributions.device)
+            mean_y = torch.stack([
+                self.distributions[-1][att_i][indices[:, att_i]]
+                for att_i in range(num_att)
+            ], dim=-1).cpu()  # (N, A)
+            scores = (mean_y @ att_w).view(-1)                                 # (N,)
+            all_scores.append(scores)
+        all_scores = torch.cat(all_scores)
+        stats = {
+            'mean': all_scores.mean().item(),
+            'std':  all_scores.std().item(),
+            'n':    len(all_scores),
+        }
+        torch.save(stats, cache_path)
+        print(f'[SupportNorm] saved: mean={stats["mean"]:.4f}, std={stats["std"]:.4f}'
+              f', n={stats["n"]}')
+        return stats
+
+    # ─── Idea A: Quantile Recalibration (2-Wasserstein OT) ──────────────────
+    def compute_support_quantiles(self, n_quantiles=1000):
+        """Build per-attribute CDF⁻¹ table from sim_log support samples."""
+        qr_file = Path(os.path.join(
+            self.args.output_dir, self.args.dataset,
+            f'support_quantiles_{n_quantiles}.pth'))
+        if qr_file.exists():
+            Q = torch.load(qr_file)
+            print(f'[QR] loaded quantiles {tuple(Q.shape)} from {qr_file}')
+            return Q
+        print('[QR] computing support quantiles from sim_log …')
+        all_cos = {}
+        dist_files = [f for f in os.listdir(self.att_root) if f.endswith('.pth')]
+        for fname in tqdm(dist_files, desc='[QR] sim_log'):
+            d = torch.load(os.path.join(self.att_root, fname))
+            cs = d['cos_sim'].view(-1, d['cos_sim'].shape[-1]).cpu().float()
+            for a in range(cs.shape[1]):
+                all_cos.setdefault(a, []).append(cs[:, a])
+        tau = torch.linspace(0, 1, n_quantiles)
+        Q = torch.stack([
+            torch.quantile(torch.cat(all_cos[a]), tau)
+            for a in range(len(all_cos))
+        ])  # (num_att, n_q)
+        torch.save(Q, qr_file)
+        print(f'[QR] saved {tuple(Q.shape)} to {qr_file}')
+        return Q
+
+    def apply_quantile_recalibration(self, cos_sims):
+        """Map test cos_sims → support quantile space (monotone transport).
+        cos_sims: (bs, n_patches, A) → recalibrated (bs, n_patches, A)
+        """
+        bs, n_patches, A = cos_sims.shape
+        device = cos_sims.device
+        Q = self.support_quantiles.to(device)          # (A, n_q)
+
+        # Guard: if support quantiles were built from a different checkpoint
+        # (different num_att), skip recalibration silently.
+        if Q.shape[0] != A:
+            print(f'[QR] WARNING: support quantiles have {Q.shape[0]} attrs '
+                  f'but model has {A} — skipping QR for this dataset')
+            return cos_sims
+
+        n_q = Q.shape[1]
+        tau = torch.linspace(0, 1, n_q, device=device) # (n_q,)
+
+        # Reshape to (bs*A, n_patches) for vectorised processing
+        x = cos_sims.permute(0, 2, 1).reshape(bs * A, n_patches)
+
+        # Empirical rank of every element within its row → quantile level in [0,1]
+        _, sort_idx = x.sort(dim=1)
+        ranks = torch.zeros_like(x, dtype=torch.long)
+        arange = torch.arange(n_patches, device=device).unsqueeze(0).expand(bs * A, -1)
+        ranks.scatter_(1, sort_idx, arange)
+        test_tau = ranks.float() / max(n_patches - 1, 1)  # (bs*A, n_patches) ∈ [0,1]
+
+        # Expand support quantile table to (bs*A, n_q)
+        # x layout: x[b*A + a, :] ↔ (batch b, attribute a)
+        # so Q_exp[b*A + a, :] must equal Q[a, :]
+        # → tile Q bs times along a new leading dim, then flatten
+        Q_exp   = Q.unsqueeze(0).expand(bs, -1, -1).reshape(bs * A, n_q)  # (bs*A, n_q)
+        tau_exp = tau.unsqueeze(0).expand(bs * A, -1)
+
+        # Linear interpolation: find bracket in tau space
+        idx  = torch.searchsorted(tau_exp.contiguous(), test_tau.contiguous()).clamp(1, n_q - 1)
+        idx0 = idx - 1
+        q1 = Q_exp.gather(1, idx);  t1 = tau_exp.gather(1, idx)
+        q0 = Q_exp.gather(1, idx0); t0 = tau_exp.gather(1, idx0)
+        w = ((test_tau - t0) / (t1 - t0 + 1e-8)).clamp(0, 1)
+        mapped = q0 + w * (q1 - q0)  # (bs*A, n_patches)
+
+        return mapped.reshape(bs, A, n_patches).permute(0, 2, 1)  # (bs, n_patches, A)
+
+    # ─── Idea B: Conformal / rank-based normalisation ───────────────────────
+    def conformal_normalize(self, scores, eps=1e-4):
+        """Replace z-score with logit(rank quantile) for distribution-free calibration.
+        scores: (bs, n_patches) → same shape, well-calibrated in (-∞, +∞)
+        """
+        flat = scores.view(scores.shape[0], -1)          # (bs, N)
+        sorted_flat, _ = flat.sort(dim=1)
+        N = flat.shape[1]
+        ranks = torch.searchsorted(sorted_flat.contiguous(), flat.contiguous())
+        quantiles = ranks.float() / max(N - 1, 1)        # ∈ [0, 1]
+        quantiles = quantiles.clamp(eps, 1 - eps)
+        return torch.log(quantiles / (1 - quantiles))    # logit → (-∞, +∞)
+
+    # ─── Idea C: MIWA – entropy-weighted attribute importance ───────────────
+    def compute_mi_weights(self, n_bins=50):
+        """Per-attribute marginal entropy as a proxy for universality.
+        High-entropy attributes are less class-specific → up-weight for UNK.
+        """
+        mi_file = Path(os.path.join(
+            self.args.output_dir, self.args.dataset, 'miwa_weights.pth'))
+        if mi_file.exists():
+            w = torch.load(mi_file)
+            print(f'[MIWA] loaded weights {tuple(w.shape)} from {mi_file}')
+            return w
+        print('[MIWA] computing entropy-based attribute weights …')
+        all_cos = {}
+        dist_files = [f for f in os.listdir(self.att_root) if f.endswith('.pth')]
+        for fname in tqdm(dist_files, desc='[MIWA] sim_log'):
+            d = torch.load(os.path.join(self.att_root, fname))
+            cs = d['cos_sim'].view(-1, d['cos_sim'].shape[-1]).cpu().float()
+            for a in range(cs.shape[1]):
+                all_cos.setdefault(a, []).append(cs[:, a])
+        H = []
+        for a in range(len(all_cos)):
+            vals = torch.cat(all_cos[a]).numpy()
+            hist, _ = np.histogram(vals, bins=n_bins, range=(-1.0, 1.0), density=False)
+            p = hist / (hist.sum() + 1e-8)
+            p = p[p > 0]
+            H.append(float(-(p * np.log(p)).sum()))
+        H = torch.tensor(H, dtype=torch.float32)
+        # Scale to mean=1, shape preserved
+        w = torch.softmax(H, dim=0) * len(H)
+        torch.save(w, mi_file)
+        print(f'[MIWA] entropy range [{H.min():.3f}, {H.max():.3f}]')
+        return w
+
+    # ─── Idea D: SACA – Spatial Adaptive Confidence Alpha ───────────────────
+    def calibrate_saca(self):
+        """Initialise / load SACA scalars (gamma, beta).
+        alpha_p = sigmoid(gamma * density_p + beta)
+        """
+        saca_file = Path(os.path.join(
+            self.args.output_dir, self.args.dataset, 'saca_params.pth'))
+        if saca_file.exists():
+            p = torch.load(saca_file)
+            self.saca_gamma = p['gamma']
+            self.saca_beta  = p['beta']
+            print(f'[SACA] loaded γ={self.saca_gamma:.3f}, β={self.saca_beta:.3f}')
+            return
+        # Default: gamma=1, beta=-0.5 (slightly favour unknown region)
+        self.saca_gamma = torch.tensor(1.0)
+        self.saca_beta  = torch.tensor(-0.5)
+        torch.save({'gamma': self.saca_gamma, 'beta': self.saca_beta}, saca_file)
+        print(f'[SACA] initialised γ={self.saca_gamma:.3f}, β={self.saca_beta:.3f}')
 
     def get_known_distribution(self, cos_sims):
         # bs, patch*patch, num_att
@@ -707,7 +1069,14 @@ class FOMO(nn.Module):
                                        shuffle=True,
                                        drop_last=True)
 
+            if args.use_attributes and args.eval_model and getattr(args, 'load_weights_only', False):
+                print(f"[{args.dataset}] Loading backbone weights only from {args.eval_model}, using new attributes.")
+                self.load_model(args.eval_model, load_att=False)
+                args_eval_model_backup = args.eval_model
+                args.eval_model = ''  # temporarily disable so attribute pipeline runs below
+
             if args.use_attributes and (not args.eval_model):
+                print(f"[{args.dataset}] Building attribute-aware detector from few-shot data.")
                 # object which (is/has/etc) shape is blue
                 with open(f'data/{args.data_task}/ImageSets/{args.dataset}/{args.attributes_file}', 'r') as f:
                     attributes = json.loads(f.read())
@@ -722,6 +1091,7 @@ class FOMO(nn.Module):
                     self.att_query_mask = att_query_mask.to(device)
 
                 if args.att_selection:
+                    print(f"[{args.dataset}] Starting attribute selection for {args.neg_sup_ep * 500} steps.")
                     self.attribute_selection(embeds_dataset, args.neg_sup_ep * 500, args.neg_sup_lr)
                     selected_idx = torch.where(torch.sum(self.att_W, dim=1) != 0)[0]
                     self.att_embeds = torch.index_select(self.att_embeds, 1, selected_idx)
@@ -733,10 +1103,14 @@ class FOMO(nn.Module):
                 self.att_query_mask = None
 
                 if args.att_adapt:
+                    print(f"[{args.dataset}] Starting attribute adaptation.")
                     self.adapt_att_embeddings(mean_known_query_embeds)
+                    print(f"[{args.dataset}] Finished attribute adaptation.")
 
                 if args.att_refinement:
+                    print(f"[{args.dataset}] Starting attribute refinement for {args.neg_sup_ep} epochs.")
                     self.attribute_refinement(fs_dataloader, args.neg_sup_ep, args.neg_sup_lr)
+                    print(f"[{args.dataset}] Finished attribute refinement.")
 
                 if args.use_attributes:
                     self.att_embeds = torch.cat([self.att_embeds, torch.matmul(self.att_embeds.squeeze().T, self.att_W).mean(1, keepdim=True).T.unsqueeze(0)], dim=1)
@@ -748,8 +1122,10 @@ class FOMO(nn.Module):
                 eye_unknown = torch.eye(1, device=self.device)
                 self.att_W = torch.block_diag(self.att_W, eye_unknown)
             elif args.eval_model:
+                print(f"[{args.dataset}] Loading saved model from {args.eval_model}")
                 self.load_model(args.eval_model)
             else:
+                print(f"[{args.dataset}] Building simple image-conditioned baseline.")
                 ## run simple baseline
                 with torch.no_grad():
                     mean_known_query_embeds, _ = self.get_mean_embeddings(fs_dataset)
@@ -763,7 +1139,18 @@ class FOMO(nn.Module):
             self.att_W = torch.eye(len(all_classnames), device=self.device)    
 
         if args.log_distribution:
+            print(f"[{args.dataset}] Logging similarity distribution.")
             self.log_distribution(fs_dataloader, args)
+
+        # Runtime metadata for HARA/debug wrappers. This is intentionally stored
+        # on args because UnkDetHead/ClassDistribution only receive args and
+        # att_W, not the enclosing FOMO instance.
+        args.hara_runtime_attributes_texts = list(getattr(self, "attributes_texts", []))
+        args.hara_runtime_att_embeds = getattr(self, "att_embeds", None)
+        args.hara_runtime_att_W = getattr(self, "att_W", None)
+        if "args_eval_model_backup" in locals():
+            args.eval_model = args_eval_model_backup
+            args.hara_loaded_weights_only = True
 
         self.unk_head = UnkDetHead(args.unk_method, known_dims=len(known_class_names),
                                    att_W=self.att_W, device=device, args=args)
@@ -825,11 +1212,14 @@ class FOMO(nn.Module):
         return
 
     def patch_cosine_similarity(self, image_embeds, att_embeds):
-        att_embeds = att_embeds.squeeze(0)
-        ret = []
-        for att_embed in att_embeds:
-            ret.append(cosine_similarity(image_embeds, att_embed,dim=-1))
-        return torch.stack(ret, dim=1).squeeze(-1)
+        # Vectorised: (N, D) x (D, A) → (N, A)  — replaces O(A) Python loop
+        att = att_embeds.squeeze(0)                    # (A, D)  [removes leading 1-dim]
+        img = image_embeds.float()
+        if img.dim() == 3:
+            img = img.squeeze(1)                       # (N, 1, D) → (N, D)
+        img_n = F.normalize(img,          p=2, dim=-1) # (N, D)
+        att_n = F.normalize(att.float(),  p=2, dim=-1) # (A, D)
+        return (img_n @ att_n.T)                       # (N, A)
     
 
     def attribute_selection(self, fs_dataloader, epochs, lr):
@@ -1049,15 +1439,15 @@ class FOMO(nn.Module):
 
         return pred_logits, cos_sim
 
-    def load_model(self, model_path):
+    def load_model(self, model_path, load_att=True):
         print(f'load {model_path}')
         check_point = torch.load(model_path, map_location=self.device)
         self.load_state_dict(check_point['main_weights'], strict=False)
-        self.att_embeds = check_point['att_embeds']
-        self.att_W = check_point['att_W']
-
-        self.att_query_mask = check_point['att_query_mask']
-        self.attributes_texts = check_point['attributes_texts']
+        if load_att:
+            self.att_embeds = check_point['att_embeds']
+            self.att_W = check_point['att_W']
+            self.att_query_mask = check_point['att_query_mask']
+            self.attributes_texts = check_point['attributes_texts']
 
          
     def forward(
@@ -1128,13 +1518,17 @@ class FOMO(nn.Module):
 
 class PostProcess(nn.Module):
     """ This module converts the model's output into the format expected by the coco api"""
-    def __init__(self, model_name, pred_per_im=100, image_resize=768, device='cpu', method='regular'):
+    def __init__(self, model_name, pred_per_im=100, image_resize=768, device='cpu', method='regular', args=None):
         super().__init__()
         self.processor = OwlViTProcessor.from_pretrained(model_name)
         self.pred_per_im = pred_per_im
         self.method=method
         self.image_resize = image_resize
         self.device = device
+        self.use_postprocess_known_gate = getattr(args, 'use_postprocess_known_gate', False)
+        self.post_gate_known_threshold = getattr(args, 'post_gate_known_threshold', 0.15)
+        self.post_gate_unknown_margin = getattr(args, 'post_gate_unknown_margin', 1.1)
+        self.post_gate_floor = getattr(args, 'post_gate_floor', 0.05)
         self.clip_boxes = lambda x, y: torch.cat(
             [x[:, 0].clamp_(min=0, max=y[1]).unsqueeze(1),
              x[:, 1].clamp_(min=0, max=y[0]).unsqueeze(1),
@@ -1172,6 +1566,17 @@ class PostProcess(nn.Module):
         logits, obj, boxes = outputs.logits, outputs.obj, outputs.pred_boxes
         prob = torch.sigmoid(logits)            # 直接用sigmoid函数将logits转换为概率
         prob[..., -1] *= obj
+        if self.use_postprocess_known_gate and prob.shape[-1] > 1:
+            known_best = prob[..., :-1].max(dim=-1).values
+            unknown_score = prob[..., -1]
+            known_confident = known_best >= self.post_gate_known_threshold
+            unknown_not_dominant = unknown_score <= (known_best * self.post_gate_unknown_margin)
+            gate_mask = known_confident & unknown_not_dominant
+            prob[..., -1] = torch.where(
+                gate_mask,
+                unknown_score * self.post_gate_floor,
+                unknown_score,
+            )
         
         if target_sizes is not None:
             if len(logits) != len(target_sizes):
@@ -1330,5 +1735,5 @@ def build(args):
     model = FOMO(args, args.model_name, known_class_names, unknown_class_names,
                  templates, args.image_conditioned, device)
 
-    postprocessors = PostProcess(args.model_name, args.pred_per_im, args.image_resize, device, method=args.post_process_method)
+    postprocessors = PostProcess(args.model_name, args.pred_per_im, args.image_resize, device, method=args.post_process_method, args=args)
     return model, postprocessors
